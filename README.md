@@ -83,6 +83,24 @@ deterministic, no LLM, no network needed except to fetch the tarball.
 
 **Full results: [FINDINGS.md](FINDINGS.md)** (method, noise taxonomy, what surfaced).
 
+### n8n community nodes and Node-RED nodes
+
+Both are npm packages that run inside an automation server holding every workflow's credentials,
+so `npm-audit` auto-detects them (from the `n8n` / `node-red` field in `package.json`, or force
+it with `--n8n` / `--node-red`) and adds host-specific rules:
+
+| Pattern | Severity |
+| --- | --- |
+| Workflow credentials + a hard-coded collector (webhook.site, paste site, tunnel, literal chat webhook) + a send | CRITICAL |
+| n8n: reaching into the instance (`N8N_ENCRYPTION_KEY`, `~/.n8n/config`, the credential DB, n8n internals) | HIGH |
+| Node-RED: reading `flows_cred.json` / `.config.*.json` (HIGH with network, CRITICAL with a collector) | MEDIUM+ |
+| Node-RED: `RED.httpAdmin` routes without `RED.auth.needsPermission`, credential lookups by request id | MEDIUM |
+| n8n: `getCredentials()` for a type the package never declares | MEDIUM |
+
+Measured on 4,967 nodes (2,500 n8n, 2,467 Node-RED; calibration plus blind held-out sets): 0
+false positives at HIGH or worse after calibration, and 0 in the held-out sets.
+**Results: [FINDINGS-n8n-node-red.md](FINDINGS-n8n-node-red.md)**.
+
 ## Usage
 
 ```bash
@@ -93,6 +111,8 @@ python npm_audit.py suspicious.js                 # one file
 python npm_audit.py --lockfile package-lock.json  # every dependency in a v1/v2/v3 lockfile
 python npm_audit.py --node-modules ./node_modules # every installed package, separately
 python npm_audit.py --text "…"                    # a string
+python npm_audit.py --keyword n8n-community-node-package --limit 500  # bulk: registry search
+python npm_audit.py <target> --n8n | --node-red   # force the host-specific rules
 python npm_audit.py <target> --json               # machine-readable
 python npm_audit.py <target> --verbose            # also print INFO context
 ```
@@ -114,10 +134,14 @@ r["risk_level"], r["findings"], r["install_scripts"]
 python tests/run.py
 ```
 
-Ten inert malicious canaries (env exfil, webhook stealer, pipe-to-shell, inline `node -e`
-beacon, obfuscation, reverse shell, wallet theft, DNS beacon, worm, wiper) must each fire at the
-right severity. Six benign controls modelled on real top packages (binary installer, node-gyp,
-funding banner, config loader, CLI wrapper, env debug print) must all scan SAFE. The canaries
+Eighteen inert malicious canaries (env exfil, webhook stealer, pipe-to-shell, runtime exec of
+`curl | sh`, inline `node -e` beacon, obfuscation, reverse shell, wallet theft, DNS beacon, host
+recon beacon, worm, wiper, plus n8n credential exfil / encryption-key theft / undeclared
+credential and Node-RED credential-store theft / unauthenticated credential routes) must each
+fire at the right severity. Twelve benign controls modelled on real packages (binary installer,
+node-gyp, funding banner, config loader, CLI wrapper, env debug print, install-hint strings,
+release scripts, typical n8n and Node-RED nodes, a Telegram integration, a vendor callback URL)
+must land where expected. The canaries
 use reserved `.invalid` / TEST-NET hosts, and nothing in `tests/` is ever executed.
 
 ## Limits
