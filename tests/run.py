@@ -25,7 +25,20 @@ EXPECT = {
     "mal-dns-beacon": ("CRITICAL", "dns_exfil"),
     "mal-worm": ("CRITICAL", "worm_propagation"),
     "mal-wiper": ("CRITICAL", "destructive"),
+    # n8n / Node-RED host context
+    "mal-n8n-cred-exfil": ("CRITICAL", "automation_credential_exfil"),
+    "mal-n8n-enckey": ("CRITICAL", "n8n_internal_secrets"),
+    "mal-n8n-undeclared": ("MEDIUM", "n8n_undeclared_credential"),
+    "mal-nodered-credstore": ("CRITICAL", "nodered_credential_store"),
+    "mal-nodered-admin": ("MEDIUM", "nodered_admin_noauth"),
+    "mal-exec-curl": ("CRITICAL", "download_execute"),
+    "mal-recon-beacon": ("HIGH", "recon_beacon"),
+    "mal-nodered-oauthpath": ("MEDIUM", "nodered_admin_noauth"),
 }
+
+
+# fixtures that must land on an exact level while NOT firing a given rule
+PARTIAL = {"ok-n8n-callback": ("HIGH", "automation_credential_exfil")}
 
 
 def main():
@@ -34,7 +47,10 @@ def main():
     for name in sorted(os.listdir(root)):
         r = na.scan_package(na.files_from_dir(os.path.join(root, name)), name)
         ids = sorted({f["id"] for f in r["findings"]})
-        if name.startswith("mal-"):
+        if name in PARTIAL:
+            want, fid = PARTIAL[name]
+            ok = r["risk_level"] == want and fid not in ids
+        elif name.startswith("mal-"):
             want, fid = EXPECT[name]
             ok = na.SEV_ORDER[r["risk_level"]] >= na.SEV_ORDER[want] and fid in ids
         else:
@@ -48,6 +64,13 @@ def main():
         (na.scan("const x = require('lodash')")["risk_level"] == "SAFE", "--text benign"),
         (na.split_spec("@scope/pkg@1.2.3") == ("@scope/pkg", "1.2.3"), "split scoped"),
         (na.split_spec("left-pad") == ("left-pad", "latest"), "split bare"),
+        (na.detect_ecosystem({"n8n": {"nodes": []}}) == "n8n", "detect n8n field"),
+        (na.detect_ecosystem({"keywords": ["n8n-community-node-package"]}) == "n8n", "detect n8n keyword"),
+        (na.detect_ecosystem({"node-red": {"nodes": {}}}) == "node-red", "detect node-red field"),
+        (na.detect_ecosystem({"keywords": ["node-red"]}) is None, "node-red keyword alone is a library, not a node"),
+        (na.detect_ecosystem({"name": "left-pad"}) is None, "detect none"),
+        (na.scan_package({"package.json": '{"name":"x"}', "a.html": "<script>eval(atob('Y2FuYXJ5'))</script>"})["risk_level"] == "SAFE",
+         "html ignored outside node-red"),
     ]
     for ok, label in checks:
         fails += not ok

@@ -22,6 +22,8 @@ Usage:
   python npm_audit.py --lockfile package-lock.json # scan every dependency in a lockfile
   python npm_audit.py --node-modules ./node_modules  # scan each installed package
   python npm_audit.py --text "some code"           # scan a string
+  python npm_audit.py --keyword n8n-community-node-package --limit 500  # bulk: registry search
+  add --n8n / --node-red to force host-specific rules (auto-detected from package.json)
   add --json for machine-readable output, --verbose to print INFO context
 
 Exit code 2 if any target is HIGH or CRITICAL (CI-friendly).
@@ -42,7 +44,7 @@ __version__ = "0.1.0"
 
 REGISTRY = os.environ.get("NPM_AUDIT_REGISTRY", "https://registry.npmjs.org").rstrip("/")
 LIFECYCLE = ("preinstall", "install", "postinstall")  # run automatically on `npm install`
-SCAN_EXT = (".js", ".cjs", ".mjs", ".jsx", ".ts", ".cts", ".mts", ".sh", ".py", ".json")
+SCAN_EXT = (".js", ".cjs", ".mjs", ".jsx", ".ts", ".cts", ".mts", ".sh", ".py", ".json", ".html")
 MAX_FILE = 1500000      # bytes; larger files are bundles - skipped (reported as info)
 MAX_TOTAL = 12000000    # bytes of text scanned per package
 MAX_LINE = 20000        # per-line regex window (minified bundles have megabyte lines)
@@ -187,6 +189,20 @@ OBF_IDENT = re.compile(r"\b_0x[0-9a-f]{4,6}\b")
 NET_RE = re.compile(NET_SEND, re.IGNORECASE)
 EXFIL_RE = re.compile(EXFIL_HOST, re.IGNORECASE)
 RAWIP_RE = re.compile(RAW_IP_URL)
+TOKEN_WORD_RE = re.compile(r"NPM_TOKEN|npm_token|_authToken", re.IGNORECASE)
+COMMENT_BLIND = {"worm_propagation", "download_execute", "destructive", "env_exfil", "auth_bypass", "exfil_host"}
+COMMENT_LINE_RE = re.compile(r"^\s*(?://|/?\*|#(?!!))")
+JS_EXT = (".js", ".cjs", ".mjs", ".jsx", ".ts", ".cts", ".mts", ".html")
+EXEC_SINK_RE = re.compile(r"(?:\bexec(?:Sync|File|FileSync)?|\bspawn(?:Sync)?|\bexeca(?:Sync|Command)?|"
+                          r"\bshell\.exec|\beval|\bFunction|\bsystem|\bexecSh|\brun(?:Command|Shell)?)\s*\(|"
+                          r"shell\s*:\s*true")
+_RECON = r"(?:whoami|id|hostname|uname(?:\s+-[a-z]+)?|cat\s+/etc/(?:passwd|os-release|hostname)|ifconfig|ip\s+a(?:ddr)?)"
+RECON_CHAIN_RE = re.compile(r"\b%s\s*(?:&&|;|\|\|)\s*%s\s*(?:&&|;|\|\|)\s*%s\b" % (_RECON, _RECON, _RECON))
+# Chat / webhook APIs that integrations call with the user's own token: only a literal,
+# hard-coded token or webhook id makes them a collector.
+CHAT_API_RE = re.compile(r"api\.telegram\.org/bot|discord(?:app)?\.com/api/webhooks/|hooks\.slack\.com/services/", re.IGNORECASE)
+HARDCODED_CHAT_RE = re.compile(r"api\.telegram\.org/bot\d{5,}:[\w-]{20,}|discord(?:app)?\.com/api/webhooks/\d{4,}/[\w-]{10,}|"
+                               r"hooks\.slack\.com/services/T\w+/B\w+/\w+", re.IGNORECASE)
 SCRIPT_FILE_RE = re.compile(r"(?:^|[\s;&|(])(?:node|sh|bash|python3?)\s+(?:-\w+\s+)*[\"']?([\w./\\-]+\.(?:c?js|mjs|sh|py))")
 INLINE_NODE_RE = re.compile(r"\bnode\s+(?:-e|--eval|-p)\s")
 # Ordinary lifecycle commands seen across the top of the registry: native builds,
@@ -208,6 +224,8 @@ def _scan_text(text, path, findings, info, install_ctx):
             m = rx.search(line[:MAX_LINE])
             if not m:
                 continue
+            if pg["id"] in COMMENT_BLIND and COMMENT_LINE_RE.match(line):
+                continue  # "// To publish: npm publish --access public" is documentation
             key = (pg["id"], n)
             if key in seen:
                 continue
@@ -221,6 +239,27 @@ def _scan_text(text, path, findings, info, install_ctx):
 
     ids = {k[0] for k in seen}
     has_net = bool(NET_RE.search(text))
+    # A `curl ... | sh` that only sits in a JS string (an install hint in an error message or
+    # help text) is shown to the user, not run. It is a finding only when the same line hands
+    # it to an exec/spawn sink, when the file is a shell script, or at install time.
+    if "download_execute" in ids and not install_ctx and path.endswith(JS_EXT):
+        for f in findings:
+            if (f["id"] == "download_execute" and f["file"] == path and f["line"]
+                    and not EXEC_SINK_RE.search(lines[f["line"] - 1][:MAX_LINE])):
+                f["severity"] = "INFO"
+                f["description"] += " [string only: not passed to exec/spawn]"
+        _demote(findings, info)
+    # `npm publish --access public` alone is a maintainer's release script (shipped .sh, Makefile,
+    # docs). The worm shape uses a stolen token, the -/whoami probe, or execs publish from JS.
+    if "worm_propagation" in ids and not install_ctx:
+        for f in findings:
+            if (f["id"] == "worm_propagation" and f["file"] == path
+                    and re.match(r"npm\s+publish", f["matched"]) and not TOKEN_WORD_RE.search(f["matched"])
+                    and not (path.endswith(JS_EXT) and f["line"]
+                             and EXEC_SINK_RE.search(lines[f["line"] - 1][:MAX_LINE]))):
+                f["severity"] = "INFO"
+                f["description"] += " [release script, no token]"
+        _demote(findings, info)
     # Combination rules ----------------------------------------------------------------
     # env dump with no network sink anywhere in the file is a debug print, not exfil.
     if "env_exfil" in ids and not has_net:
@@ -245,6 +284,18 @@ def _scan_text(text, path, findings, info, install_ctx):
         findings.append({"severity": "CRITICAL", "id": "credential_exfil", "name": "Credential Exfiltration",
                          "description": "Reads a credential store and sends to an exfil endpoint in the same file",
                          "file": path, "line": 0, "matched": "", "context": "file-level combination"})
+    # host-recon beacon: a chain of identity commands (id && hostname && whoami && uname -a)
+    # handed to exec in a file that also sends data - the dependency-confusion / RCE-proof shape
+    m = RECON_CHAIN_RE.search(text) if has_net else None
+    if m:
+        ln = text.count("\n", 0, m.start())
+        if EXEC_SINK_RE.search(lines[ln][:MAX_LINE]):
+            findings.append({"severity": "HIGH", "id": "recon_beacon", "name": "Host Recon Beacon",
+                             "description": "Runs a chain of host-identity commands and sends data out in the same file",
+                             "file": path, "line": ln + 1, "matched": m.group(0)[:120],
+                             "context": lines[ln].strip()[:200]})
+            if install_ctx:
+                findings[-1]["severity"] = "CRITICAL"
     # javascript-obfuscator output: dozens of _0x identifiers
     obf = len(OBF_IDENT.findall(text[:3000000]))
     if obf >= 25:
@@ -285,7 +336,8 @@ def _lifecycle(pkg_json, files, findings, info):
                              "description": "`node -e` in a lifecycle script that performs network I/O",
                              "file": "package.json#scripts.%s" % hook, "line": 0,
                              "matched": cmd[:120], "context": cmd[:200]})
-        elif re.search(r"\b(?:curl|wget)\b", cmd) and not BENIGN_SCRIPT.match(cmd):
+        elif (re.search(r"\b(?:curl|wget)\b", re.sub(r"\b(?:echo|printf)\s+(['\"]).*?\1", "", cmd, flags=re.S))
+              and not BENIGN_SCRIPT.match(cmd)):
             findings.append({"severity": "HIGH", "id": "install_fetch", "name": "Install-Time Fetch",
                              "description": "Lifecycle script shells out to curl/wget",
                              "file": "package.json#scripts.%s" % hook, "line": 0,
@@ -296,8 +348,158 @@ def _lifecycle(pkg_json, files, findings, info):
     return run_files
 
 
-def scan_package(files, label=""):
-    """files: {relative_path: text}. Returns an audit result dict."""
+# ---------------------------------------------------------------------------
+# Ecosystem context: n8n community nodes and Node-RED nodes
+# ---------------------------------------------------------------------------
+# Both are ordinary npm packages, but they run inside an automation server that holds the
+# credentials of every service its workflows touch. A node is meant to read *its own*
+# credentials (n8n: this.getCredentials('<declared type>'); Node-RED: this.credentials).
+# Reaching for the server's own secrets - n8n's encryption key / database, Node-RED's
+# flows_cred.json / credentialSecret - or exposing credential lookups through an
+# unauthenticated admin endpoint is the attack surface specific to these hosts.
+ECO_N8N, ECO_NODE_RED = "n8n", "node-red"
+
+N8N_INTERNAL_RE = re.compile(
+    r"(?:\.n8n[/\\](?:config\b|database\.sqlite|crash\.journal|binaryData)|"
+    r"process\.env(?:\.|\[\s*['\"])N8N_ENCRYPTION_KEY\b|\bUserSettings\s*\.\s*getEncryptionKey\s*\(|"
+    r"instanceSettings\s*\)?\s*\.\s*encryptionKey|\bcredentials_entity\b|"
+    r"\bCredentialsRepository\b|\bSharedCredentialsRepository\b|['\"]@n8n/db['\"]|"
+    r"require\s*\(\s*['\"]n8n(?:/[\w./-]+)?['\"]\s*\)|from\s+['\"]n8n(?:/[\w./-]+)?['\"])")
+N8N_GETCRED_RE = re.compile(r"\bgetCredentials\s*(?:<[^>]{0,80}>)?\s*\(\s*(['\"])([\w.-]{1,80})\1")
+N8N_DECLARED_RE = re.compile(r"\bname\s*[:=]\s*['\"]([\w.-]{1,80})['\"]")
+# credential types that ship with n8n itself and may be requested by any node
+N8N_BUILTIN_CREDS = {"httpBasicAuth", "httpDigestAuth", "httpHeaderAuth", "httpQueryAuth",
+                     "httpCustomAuth", "oAuth1Api", "oAuth2Api", "httpSslAuth", "httpBearerAuth"}
+NR_CRED_STORE_RE = re.compile(
+    r"(?:readFile\w*|createReadStream|readJson\w*|path\s*\.\s*(?:join|resolve))\s*\([^;\n]{0,160}?"
+    r"(?:flows?_cred\w*\.json|\.config\.(?:runtime|users)\.json|\.node-red[/\\](?:flows|\.config))")
+NR_SECRET_RE = re.compile(r"settings\s*(?:\.\s*|\[\s*['\"])_?credentialSecret\b")
+PLACEHOLDER_RE = re.compile(r"(?:\b(?:your|my)[-_]|xxxx|<[\w-]+>|\{[\w-]+\}|\b123456\b|example)", re.IGNORECASE)
+TEST_PATH_RE = re.compile(r"(?:^|/)(?:tests?|__tests__|spec|examples?|docs?|demo)/", re.IGNORECASE)
+NR_GETCRED_RE = re.compile(r"\bRED\s*\.\s*nodes\s*\.\s*getCredentials\s*\(\s*([^)]{1,80})\)")
+NR_ADMIN_RE = re.compile(r"\bRED\s*\.\s*httpAdmin\s*\.\s*(get|post|put|delete|patch|all|use)\s*\(")
+NR_ADMIN_SENSITIVE_RE = re.compile(
+    r"getCredentials|\.credentials\b|child_process|\bexec(?:Sync|File)?\s*\(|\bspawn(?:Sync)?\s*\(|"
+    r"writeFile(?:Sync)?\s*\(|unlink(?:Sync)?\s*\(|rmSync\s*\(")
+CALLBACK_KEY_RE = re.compile(r"(?:callback|notify|notification|return|redirect)\w{0,12}['\"]?\s*[:=]\s*['\"`]?(?:https?://)?[\w.-]{0,40}$",
+                             re.IGNORECASE)
+CRED_USE_RE = re.compile(r"\bgetCredentials\s*\(|\bthis\.credentials\b|\bnode\.credentials\b")
+
+
+def detect_ecosystem(pkg_json):
+    """'n8n', 'node-red' or None, from the package.json the host itself reads."""
+    pj = pkg_json if isinstance(pkg_json, dict) else {}
+    kws = {str(k).lower() for k in (pj.get("keywords") or []) if isinstance(k, str)}
+    if isinstance(pj.get("n8n"), dict) or "n8n-community-node-package" in kws:
+        return ECO_N8N
+    if isinstance(pj.get("node-red"), dict):
+        return ECO_NODE_RED
+    return None
+
+
+def _eco_item(sev, pid, name, desc, path, text, pos, matched):
+    line = text.count("\n", 0, pos) + 1
+    ls = text.rfind("\n", 0, pos) + 1
+    le = text.find("\n", pos)
+    le = len(text) if le < 0 else le
+    ctx = text[max(ls, pos - 80):min(le, pos + 120)]
+    return {"severity": sev, "id": pid, "name": name, "description": desc, "file": path,
+            "line": line, "matched": matched[:120], "context": ctx.strip()[:200]}
+
+
+def _declared_n8n(files, pkg_json):
+    names = set(N8N_BUILTIN_CREDS)
+    for path, text in files.items():
+        if path.endswith((".js", ".cjs", ".mjs", ".ts")):
+            names.update(N8N_DECLARED_RE.findall(text))
+    return names
+
+
+def _eco_scan(eco, path, text, findings, info, declared):
+    """Ecosystem-specific signals for one file. One hit per signal per file (bounded cost)."""
+    has_net = bool(NET_RE.search(text))
+    exfil = bool(EXFIL_RE.search(text))
+    if eco == ECO_N8N:
+        m = N8N_INTERNAL_RE.search(text)
+        if m:
+            sev = "CRITICAL" if (exfil and has_net) else "HIGH"
+            findings.append(_eco_item(sev, "n8n_internal_secrets", "n8n Instance Secrets",
+                                      "Reaches into the n8n instance itself (encryption key, credential "
+                                      "database, ~/.n8n, n8n internals) instead of the node's own credentials",
+                                      path, text, m.start(), m.group(0)))
+        for m in N8N_GETCRED_RE.finditer(text):
+            if m.group(2) not in declared:
+                findings.append(_eco_item("MEDIUM", "n8n_undeclared_credential", "Undeclared Credential Type",
+                                          "getCredentials() for a type this package never declares",
+                                          path, text, m.start(), m.group(0)))
+                break
+    elif eco == ECO_NODE_RED:
+        m = NR_CRED_STORE_RE.search(text)
+        if m:
+            sev = "CRITICAL" if (exfil and has_net) else ("HIGH" if has_net else "MEDIUM")
+            findings.append(_eco_item(sev, "nodered_credential_store", "Node-RED Credential Store",
+                                      "Reads the runtime's credential store file (flows_cred.json, "
+                                      ".config.*.json, ~/.node-red)" +
+                                      (" in a file that also does network I/O" if has_net else ""),
+                                      path, text, m.start(), m.group(0)))
+        m = NR_SECRET_RE.search(text)
+        if m:
+            if exfil and has_net:
+                findings.append(_eco_item("CRITICAL", "nodered_secret_exfil", "Credential Secret Exfiltration",
+                                          "Reads settings.credentialSecret and names a collector endpoint",
+                                          path, text, m.start(), m.group(0)))
+            else:
+                info.append(_eco_item("INFO", "nodered_credential_secret", "Reads credentialSecret",
+                                      "Uses the runtime's credentialSecret (e.g. as a salt or key)",
+                                      path, text, m.start(), m.group(0)))
+        for m in NR_GETCRED_RE.finditer(text):
+            arg = m.group(1).strip()
+            if arg.startswith(("req.", "request.")):
+                findings.append(_eco_item("MEDIUM", "nodered_request_credentials", "Credentials by Request Id",
+                                          "RED.nodes.getCredentials() with a node id taken from an HTTP request",
+                                          path, text, m.start(), m.group(0)))
+                break
+        for m in NR_ADMIN_RE.finditer(text):
+            head = text[m.end():m.end() + 400]
+            cut = re.search(r"function\b|=>", head)
+            args = head[:cut.start()] if cut else head[:200]
+            mw = re.sub(r"^\s*(['\"`])[^'\"`]{0,200}\1\s*,?", "", args)  # drop the route path ('/oauth2/...')
+            if "needsPermission" in mw or re.search(r"auth|permission|guard|protect", mw, re.IGNORECASE):
+                continue
+            verb = m.group(1).lower()
+            body = text[m.end():m.end() + 1500]
+            if verb == "get" and not NR_ADMIN_SENSITIVE_RE.search(body):
+                info.append(_eco_item("INFO", "nodered_admin_get", "Unauthenticated Admin GET",
+                                      "RED.httpAdmin GET route without RED.auth.needsPermission (static/UI data)",
+                                      path, text, m.start(), m.group(0)))
+                continue
+            findings.append(_eco_item("MEDIUM", "nodered_admin_noauth", "Unauthenticated Admin Route",
+                                      "RED.httpAdmin.%s route without RED.auth.needsPermission%s" % (
+                                          verb, " that touches credentials, files or processes"
+                                          if NR_ADMIN_SENSITIVE_RE.search(body) else ""),
+                                      path, text, m.start(), m.group(0)))
+            break
+    # either host: the node's own credentials + a hard-coded collector endpoint + a send.
+    # A Telegram/Discord/Slack node calling the API with the user's own bot token is the
+    # integration itself; only a literal token/webhook id baked into the code is a collector.
+    # A collector passed as a callback/notify URL to a vendor API leaks results, not credentials.
+    m = None
+    for mm in EXFIL_RE.finditer(text):
+        if CHAT_API_RE.match(mm.group(0)) and not HARDCODED_CHAT_RE.match(text, mm.start()):
+            continue
+        if CALLBACK_KEY_RE.search(text[max(0, mm.start() - 80):mm.start()]):
+            continue
+        m = mm
+        break
+    if m and has_net and CRED_USE_RE.search(text):
+        findings.append(_eco_item("CRITICAL", "automation_credential_exfil", "Workflow Credential Exfiltration",
+                                  "Reads workflow credentials and names a collector endpoint (webhook, paste "
+                                  "site, tunnel, OAST) in a file that sends data", path, text, m.start(), m.group(0)))
+
+
+def scan_package(files, label="", ecosystem=None):
+    """files: {relative_path: text}. Returns an audit result dict.
+    ecosystem: 'n8n' / 'node-red' to force host-specific rules; default auto-detects."""
     findings, info = [], []
     pkg_json = None
     if "package.json" in files:
@@ -305,6 +507,8 @@ def scan_package(files, label=""):
             pkg_json = json.loads(files["package.json"])
         except ValueError:
             pkg_json = None
+    eco = ecosystem or detect_ecosystem(pkg_json)
+    declared = _declared_n8n(files, pkg_json) if eco == ECO_N8N else set()
     run_files = _lifecycle(pkg_json, files, findings, info)
     total = 0
     for path, text in sorted(files.items()):
@@ -312,6 +516,8 @@ def scan_package(files, label=""):
             continue
         if path.endswith(".json"):
             continue  # data files: only package.json scripts matter
+        if path.endswith(".html") and (eco != ECO_NODE_RED or (path[:-5] + ".js") not in files):
+            continue  # a Node-RED editor template sits next to its node .js; other HTML is docs/demo pages
         total += len(text)
         if total > MAX_TOTAL:
             info.append({"severity": "INFO", "id": "truncated", "name": "Scan Truncated",
@@ -319,7 +525,34 @@ def scan_package(files, label=""):
                          "file": path, "line": 0, "matched": "", "context": ""})
             break
         _scan_text(text, path, findings, info, path in run_files)
-    return _summarise(findings, info, label, pkg_json)
+        if (eco and path.endswith((".js", ".cjs", ".mjs", ".ts", ".html")) and not TEST_PATH_RE.search(path)
+                and not (path.endswith(".html") and (path[:-5] + ".js") not in files)):
+            n_info = len(info)
+            _eco_scan(eco, path, text, findings, info, declared)
+            del info[n_info + 20:]  # bound per-file context noise
+    if eco:
+        brand = re.sub(r"[^a-z]", "", (pkg_json or {}).get("name", "").lower()) if isinstance(pkg_json, dict) else ""
+        for f in findings:
+            if TEST_PATH_RE.search(f["file"]) and f["file"] not in run_files:
+                f["severity"] = "INFO"
+                f["description"] += " [test/example/docs file]"
+            elif (f["id"] == "exfil_host" and brand and any(
+                    b in brand and b in f["matched"].lower() for b in ("ngrok", "telegram", "discord", "slack",
+                                                                         "pastebin", "localtunnel", "cloudflare",
+                                                                         "pipedream", "webhook"))):
+                f["severity"] = "INFO"
+                f["description"] += " [the package is an integration for this service]"
+            elif (f["id"] == "exfil_host" and CHAT_API_RE.search(f["matched"])
+                    and not HARDCODED_CHAT_RE.search(f["context"])):
+                f["severity"] = "INFO"
+                f["description"] += " [chat API called with the user's own credential]"
+            elif f["id"] == "exfil_host" and PLACEHOLDER_RE.search(f["context"]):
+                f["severity"] = "INFO"
+                f["description"] += " [placeholder / help-text URL]"
+        _demote(findings, info)
+    r = _summarise(findings, info, label, pkg_json)
+    r["ecosystem"] = eco
+    return r
 
 
 def _summarise(findings, info, label, pkg_json=None):
@@ -416,7 +649,7 @@ def files_from_dir(root):
     return out
 
 
-def audit_registry(spec):
+def audit_registry(spec, ecosystem=None):
     name, ver = split_spec(spec)
     man = fetch_manifest(name, ver)
     files = files_from_tarball(_get(man["dist"]["tarball"], timeout=120))
@@ -425,7 +658,24 @@ def audit_registry(spec):
     if man.get("scripts"):
         pj["scripts"] = man["scripts"]
     files["package.json"] = json.dumps(pj)
-    return scan_package(files, "%s@%s" % (name, man.get("version", ver)))
+    return scan_package(files, "%s@%s" % (name, man.get("version", ver)), ecosystem)
+
+
+def search_keyword(keyword, limit=250):
+    """Registry search by keyword -> [name@version], most-downloaded first (search pages of 250)."""
+    out, frm = [], 0
+    while len(out) < limit:
+        size = min(250, limit - len(out))
+        d = json.loads(_get("%s/-/v1/search?text=keywords:%s&size=%d&from=%d" % (
+            REGISTRY, urllib.parse.quote(keyword), size, frm)))
+        objs = d.get("objects") or []
+        for o in objs:
+            p = o["package"]
+            out.append(((o.get("downloads") or {}).get("monthly", 0), "%s@%s" % (p["name"], p["version"])))
+        frm += len(objs)
+        if not objs or frm >= d.get("total", 0):
+            break
+    return [s for _, s in sorted(out, key=lambda t: -t[0])]
 
 
 def lockfile_specs(path):
@@ -480,14 +730,26 @@ def main(argv=None):
         return 0
     as_json = "--json" in args
     verbose = "--verbose" in args or "-v" in args
-    args = [a for a in args if a not in ("--json", "--verbose", "-v")]
+    eco = ECO_N8N if "--n8n" in args else (ECO_NODE_RED if "--node-red" in args else None)
+    limit = 250
+    if "--limit" in args:
+        i = args.index("--limit")
+        limit = int(args[i + 1])
+        del args[i:i + 2]
+    args = [a for a in args if a not in ("--json", "--verbose", "-v", "--n8n", "--node-red")]
+    if not args:
+        print(__doc__)
+        return 0
     targets = []  # (label, thunk)
     if args[0] == "--text":
         txt = " ".join(args[1:])
         targets.append(("<text>", lambda: scan(txt)))
     elif args[0] == "--lockfile":
         for spec in lockfile_specs(args[1]):
-            targets.append((spec, (lambda s=spec: audit_registry(s))))
+            targets.append((spec, (lambda s=spec: audit_registry(s, eco))))
+    elif args[0] == "--keyword":
+        for spec in search_keyword(args[1], limit):
+            targets.append((spec, (lambda s=spec: audit_registry(s, eco))))
     elif args[0] == "--node-modules":
         root = args[1]
         for d in sorted(os.listdir(root)):
@@ -495,18 +757,18 @@ def main(argv=None):
             for sub in ds:
                 full = os.path.join(root, sub)
                 if os.path.isfile(os.path.join(full, "package.json")):
-                    targets.append((sub, (lambda f=full, s=sub: scan_package(files_from_dir(f), s))))
+                    targets.append((sub, (lambda f=full, s=sub: scan_package(files_from_dir(f), s, eco))))
     else:
         for a in args:
             if os.path.isdir(a):
-                targets.append((a, (lambda p=a: scan_package(files_from_dir(p), p))))
+                targets.append((a, (lambda p=a: scan_package(files_from_dir(p), p, eco))))
             elif os.path.isfile(a):
                 if os.path.basename(a) == "package.json":
-                    targets.append((a, (lambda p=a: scan_package(files_from_dir(os.path.dirname(p) or "."), p))))
+                    targets.append((a, (lambda p=a: scan_package(files_from_dir(os.path.dirname(p) or "."), p, eco))))
                 else:
-                    targets.append((a, (lambda p=a: scan_package({os.path.basename(p): open(p, encoding="utf-8", errors="replace").read()}, p))))
+                    targets.append((a, (lambda p=a: scan_package({os.path.basename(p): open(p, encoding="utf-8", errors="replace").read()}, p, eco))))
             else:
-                targets.append((a, (lambda s=a: audit_registry(s))))
+                targets.append((a, (lambda s=a: audit_registry(s, eco))))
     results, worst = [], "SAFE"
     for label, thunk in targets:
         try:
