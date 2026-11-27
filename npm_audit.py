@@ -92,7 +92,7 @@ PATTERNS = {
              r"(?:Object\.(?:entries|keys)|for\s*\(\s*(?:const|let|var)\s+\w+\s+in)\s*\(?\s*process\.env\s*\)?[^\n]{0,80}(?:join|push|stringify|encodeURIComponent)",
              r"querystring\.stringify\s*\(\s*process\.env",
              r"Object\.(?:keys|entries)\s*\(\s*process\s*\[\s*[\"'`]env[\"'`]\s*\]\s*\)\s*\.\s*(?:map|reduce|forEach)",
-             r"Object\.fromEntries\s*\(\s*Object\.(?:keys|entries)\s*\(\s*process(?:\.env|\s*\[\s*[\"'`]env[\"'`]\s*\])",
+             r"Object\.fromEntries\s*\(\s*Object\.(?:keys|entries)\s*\(\s*process\s*\[\s*[\"'`]env[\"'`]\s*\]",
              r"JSON\.stringify\s*\(\s*\{\s*\.\.\.process\.env\s*\}",
              r"\.(?:post|put|request|send)\s*\([^\n(){}]{1,120},\s*\{\s*\.\.\.process\.env\s*\}|\]\]?\s*\([^\n(){}]{1,80},\s*\{\s*\.\.\.process\.env\s*\}",
              r"\benv\s*:\s*process\.env\s*[,}][^\n]{0,200}(?:hostname|homedir|userInfo)",
@@ -150,7 +150,7 @@ PATTERNS = {
              r"(?:eval|new\s+Function)\s*\(\s*Buffer\.from\s*\([^)]{0,4000},\s*[\"'](?:base64|hex)[\"']",
              r"(?:eval|new\s+Function)\s*\(\s*[\"'](?:\\x[0-9a-fA-F]{2}){20,}",
              r"(?:eval|new\s+Function)\s*\(\s*String\.fromCharCode\s*\(",
-             r"\brequire\s*\(\s*(?:Buffer\.from\s*\(\s*[\"'][0-9a-fA-F]{4,}[\"']\s*,\s*[\"']hex|Buffer\.from\s*\(\s*[\"'][A-Za-z0-9+/=]{4,}[\"']\s*,\s*[\"']base64|atob\s*\(|String\.fromCharCode\s*\()",
+             r"\brequire\s*\(\s*Buffer\.from\s*\(\s*[\"'](?:[0-9a-fA-F]{4,}[\"']\s*,\s*[\"']hex|[A-Za-z0-9+/=]{4,}[\"']\s*,\s*[\"']base64)",
              r"\beval\s*\(\s*[\"'`]\(\s*function\s+[\w$]+\s*\([^\"'`]{200}",
              r"while\s*\(\s*!!\[\]\s*\)\s*\{\s*try\s*\{\s*(?:const|var|let)\s+[\w$]+\s*=\s*-?parseInt\s*\(",
          ]},
@@ -222,8 +222,8 @@ FINGERPRINT_RES = [re.compile(r) for r in (
 BARE_IP_RE = re.compile(r"[\"'`](?!(?:127\.|0\.|10\.|192\.168\.|172\.(?:1[6-9]|2\d|3[01])\.|169\.254\.|255\.))"
                         r"(?:25[0-5]|2[0-4]\d|1?\d?\d)(?:\.(?:25[0-5]|2[0-4]\d|1?\d?\d)){3}[\"'`:/]")
 SEND_CALL_RE = re.compile(r"\.(?:request|get|post|write|connect|send|end)\s*\(|\bfetch\s*\(|\baxios\b|dns\.(?:lookup|resolve)", re.IGNORECASE)
-ENC_REQUIRE_RE = re.compile(r"\brequire\s*\(\s*(?:Buffer\.from\s*\(\s*[\"'][0-9a-fA-F]{4,}[\"']\s*,\s*[\"']hex|"
-                            r"Buffer\.from\s*\(\s*[\"'][A-Za-z0-9+/=]{4,}[\"']\s*,\s*[\"']base64|atob\s*\(|String\.fromCharCode\s*\()")
+ENC_REQUIRE_RE = re.compile(r"\brequire\s*\(\s*Buffer\.from\s*\(\s*[\"'](?:[0-9a-fA-F]{4,}[\"']\s*,\s*[\"']hex|"
+                            r"[A-Za-z0-9+/=]{4,}[\"']\s*,\s*[\"']base64)")
 WALLET_SECRET_SEND_RE = re.compile(r"(?:fetch|axios(?:\.post)?|\.post)\s*\(\s*[\"'`]https?://(?!localhost|127\.)[^\"'`\s]{4,120}[\"'`]"
                                    r"[^;]{0,400}?\b(?:seed|mnemonic|privateKey|secretKey|private_key|seedPhrase)\b", re.S)
 HIDDEN_CODE_RE = re.compile(r"[;})\]][ \t]{300,}[\w$(\[!~+-]")
@@ -365,7 +365,7 @@ def _scan_text(text, path, findings, info, install_ctx):
             and SEND_CALL_RE.search(text) and "JSON.stringify" in text):
         nfp = 2  # install-time code posting the username is the beacon even without a second field
     if nfp >= 2 and has_net and SEND_CALL_RE.search(text):
-        strong = BARE_IP_RE.search(text) or EXFIL_RE.search(text) or install_ctx
+        strong = _dest_ip(text) or EXFIL_RE.search(text) or install_ctx
         if strong or (nfp >= 3 and len(text) <= 500000):  # big CLI bundles carry telemetry
             findings.append({"severity": "HIGH", "id": "host_fingerprint_exfil", "name": "Host Fingerprint Beacon",
                              "description": "Collects %d host-identity values (hostname, username, home dir, DNS "
@@ -394,7 +394,7 @@ def _scan_text(text, path, findings, info, install_ctx):
                          "context": mw.group(0)[:200].replace("\n", " ")})
     # install-time beacon to a hard-coded public IP (net.Socket / http.request to '1.2.3.4')
     if install_ctx and has_net and SEND_CALL_RE.search(text):
-        mi = BARE_IP_RE.search(text)
+        mi = _dest_ip(text)
         if mi and "raw_ip_url" not in ids:
             findings.append({"severity": "MEDIUM", "id": "raw_ip_url", "name": "Raw-IP Destination",
                              "description": "Install-time code sends to a hard-coded public IP address",
@@ -428,6 +428,19 @@ def _scan_text(text, path, findings, info, install_ctx):
             if f["file"] == path and f["severity"] in ("HIGH", "MEDIUM") and f["id"] != "auth_bypass":
                 f["severity"] = "CRITICAL"
                 f["description"] += " [runs at install time]"
+
+
+DEST_CTX_RE = re.compile(r"(?:host(?:name)?|\bip|server|addr(?:ess)?|connect|request|url|target|c2)\w*[\"'`]?\s*[:=(,]\s*[\"'`]?$|"
+                         r"\.connect\s*\([^)]{0,40}$", re.IGNORECASE)
+
+
+def _dest_ip(text):
+    """First quoted public IPv4 literal used as a destination (host key, port suffix, connect arg)."""
+    for m in BARE_IP_RE.finditer(text):
+        tail = text[m.end() - 1:m.end() + 7]
+        if re.match(r":\d{2,5}", tail) or DEST_CTX_RE.search(text[max(0, m.start() - 40):m.start() + 1]):
+            return m
+    return None
 
 
 def _line_window(text, m, w=MAX_LINE // 2):
@@ -704,7 +717,19 @@ def scan_package(files, label="", ecosystem=None):
                          "description": "Package exceeds %d bytes of text" % MAX_TOTAL,
                          "file": path, "line": 0, "matched": "", "context": ""})
             break
-        _scan_text(text, path, findings, info, path in run_files)
+        if len(text) > MAX_FILE and path not in run_files:
+            # A multi-megabyte bundle nobody runs at install time contains every capability
+            # (telemetry, env plumbing, .npmrc handling): keep only payload-specific signals.
+            tmp = []
+            _scan_text(text, path, tmp, info, False)
+            for f in tmp:
+                if f["id"] not in BIG_STRICT:
+                    f["severity"] = "INFO"
+                    f["description"] += " [large bundle: capability signal only]"
+            findings.extend(tmp)
+            _demote(findings, info)
+        else:
+            _scan_text(text, path, findings, info, path in run_files)
         if (eco and path.endswith((".js", ".cjs", ".mjs", ".ts", ".html")) and not TEST_PATH_RE.search(path)
                 and not (path.endswith(".html") and (path[:-5] + ".js") not in files)):
             n_info = len(info)
@@ -735,7 +760,9 @@ def scan_package(files, label="", ecosystem=None):
     return r
 
 
-BIG_FILES = True   # also scan >MAX_FILE files that no install script runs
+BIG_FILES = True   # also scan >MAX_FILE files that no install script runs (strict rule subset)
+BIG_STRICT = {"worm_propagation", "obfuscation", "hidden_code", "wallet_secret_exfil", "reverse_shell",
+              }
 DEP_FIELDS = ("dependencies", "optionalDependencies", "peerDependencies", "devDependencies")
 # hosts a dependency URL may legitimately point at
 DEP_URL_OK = re.compile(r"^(?:git\+)?https?://(?:[\w-]+\.)*(?:github\.com|githubusercontent\.com|gitlab\.com|bitbucket\.org|"
